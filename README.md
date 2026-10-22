@@ -179,6 +179,7 @@ later — if present, llama.cpp may already be using a path our estimates ignore
 
 | file | purpose |
 |---|---|
+| `BRIEFING.txt` | self-contained plain-text brief for a person or AI agent asked to run this on other hardware: findings, which CPUs to test, procedure, caveats |
 | `cpu_decision_bench.sh` | the self-contained profiler described above |
 | `conc_bench.py` | concurrency sweep against a running server |
 | `layer_size.py` | per-layer GGUF footprint (standalone parser, no deps) |

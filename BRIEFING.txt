@@ -1,0 +1,513 @@
+BRIEFING: CPU inference for decision models (System One / Jev class)
+=====================================================================
+Prepared for an AI agent assisting with server/hardware evaluation.
+Date of measurements: 22 October 2026.
+
+This document is self-contained. You do not need to open any link to act on it.
+Everything needed to reproduce the work is in a public git repository.
+
+
+-------------------------------------------------------------------------------
+0. WHAT YOU ARE BEING ASKED
+-------------------------------------------------------------------------------
+
+A benchmark was run on two desktop CPUs to find out whether a "decision model"
+can be served usefully from a CPU instead of a GPU. The result was partly
+surprising and the limiting factor turned out NOT to be what was expected.
+
+The request: run the same benchmark on server-class CPUs, which the recipient
+has access to in quantity, and report back. Section 6 lists exactly which CPUs
+are worth testing and why; section 7 is the procedure.
+
+One open question matters more than the rest, and no machine available to the
+original tester can answer it. It is stated in section 5.
+
+
+-------------------------------------------------------------------------------
+1. RESOURCES
+-------------------------------------------------------------------------------
+
+Code (public, MIT, no login required):
+    https://github.com/sku10/cpu-decision-bench
+
+    If you are reading this as BRIEFING.txt inside the repository, you already
+    have all of it; the files below are beside this one.
+
+    cpu_decision_bench.sh   one-command profiler; builds everything itself
+    README.md               measured results + how to read your own
+    DECISION_MODELS.md      reference for the model class (wire format, the
+                            four question types, exact confidence formulas,
+                            real context limits)
+    decision_confidence.py  those formulas, with a self-test against every
+                            published vendor value
+    conc_bench.py           concurrency sweep against a running server
+    layer_size.py           per-layer footprint of a GGUF file
+    run_jevbench.py         accuracy + calibration over a JevBench dataset
+    compare_cpu_gpu.py      item-by-item diff of two runs
+
+Narrative report (a formatted version of this same material):
+    https://claude.ai/artifact/FQ9hh7ovZprBuGnDkA6FzK
+
+    NOTE: that link probably requires a Claude account to open, and it may not
+    be shared with you. Do not treat it as a dependency. This text contains the
+    same findings. If you cannot open it, ignore it and continue.
+
+
+-------------------------------------------------------------------------------
+2. WHAT A DECISION MODEL IS (brief, because it explains the performance)
+-------------------------------------------------------------------------------
+
+A decision model takes a "state" (the content to judge) plus one or more typed
+questions, and returns a typed value with a calibrated probability. It generates
+no text at all: no prose, no reasoning trace, nothing to parse. Code branches on
+the returned value directly.
+
+Question types:
+    noul    yes/no   -> a single probability that the answer is yes (0..1)
+    choice  pick one -> the option, a probability for each option, confidence
+    score   scale    -> a probability-weighted position on ordered levels
+    box     image    -> a bounding box (newer models only)
+
+Why this matters for CPU performance:
+
+Ordinary LLM work on a CPU is dominated by DECODE: generating one token at a
+time, each token requiring a full pass over the model weights. It is memory
+bound in the worst way and famously slow.
+
+A decision model never decodes. output_tokens is 0. Every request is pure
+PREFILL: one batched pass over several hundred to a few thousand tokens. That is
+a much better-shaped problem, and it is the only reason any of this is viable on
+a CPU.
+
+Model under test: H2O-Lightning-4B, a 4B-parameter open-weights decision model
+(Qwen3.5-4B fine-tune, Apache-2.0), 32 layers. Served by llama.cpp at pinned
+commit 0a1ef30 via its native POST /v1/systemone endpoint. Benchmark set: the
+231 public JevBench decisions; all three dataset checksums matched the upstream
+manifest.
+
+
+-------------------------------------------------------------------------------
+3. THE FINDINGS, IN THE ORDER THEY WERE DISCOVERED
+-------------------------------------------------------------------------------
+
+The chronology matters. Each test was provoked by the previous result, and two
+intermediate conclusions were WRONG. They are included because the wrong turns
+explain why the final answer is counterintuitive.
+
+STEP 1 - Does it work on CPU, and does accuracy survive?
+--------------------------------------------------------
+Same binary, same weights, same 231 decisions; only "-ngl 0" to force every
+layer onto the CPU.
+
+    run              correct    ECE      p50      p95
+    Q8_0  GPU        204/231    0.0597    64 ms    859 ms
+    Q8_0  CPU        204/231    0.0558   424 ms   2768 ms
+    Q4_K_M GPU       202/231    0.0372    65 ms    900 ms
+    Q4_K_M CPU       202/231    0.0399   300 ms   2154 ms
+
+ACCURACY IS UNCHANGED. At Q8_0, zero of 231 answers differ between CPU and GPU.
+Per-type and per-family breakdowns match exactly.
+
+It is not bit-identical: 222 of 231 confidence values drift by up to 0.046,
+because different BLAS kernels accumulate floating point in a different order.
+Every large drift sits on a low-confidence item (0.35-0.58), where the
+probability distribution is flat and small logit changes move the most mass.
+
+The operationally important part: NO ITEM CROSSES THE 0.80 OR 0.90 CONFIDENCE
+BAND. So a production gate of "act automatically at >=0.90, otherwise escalate"
+makes the identical decision on all 231 items whether it ran on CPU or GPU.
+CPU can be a drop-in overflow tier with no threshold re-tuning.
+
+STEP 2 - Thread scaling. First surprise.
+----------------------------------------
+Swept -t 1 .. -t 16 on an 8-core/16-thread CPU, one request at a time, over the
+111 hardest items (median state ~1600 characters, ~1500 tokens).
+
+    threads    p50       p95       wall (111 items)
+    1          834 ms    3237 ms   147 s
+    2          819 ms    3147 ms   142 s
+    4          819 ms    3161 ms   141 s
+    8          826 ms    3257 ms   142 s
+    16        2387 ms    3771 ms   193 s      <-- 2.9x REGRESSION
+
+One thread is as fast as eight. The whole 1->8 range is flat to within 2%.
+Using all SMT threads (-t 16) is a 2.9x regression from thread contention on
+matmuls too small to split.
+
+ACTION FOR YOU: set thread count to PHYSICAL cores, never logical threads. The
+original tester's first CPU numbers were all measured at -t 16 before this was
+caught, so any earlier figures quoted elsewhere are too pessimistic.
+
+STEP 3 - Why no difference? Two wrong explanations.
+---------------------------------------------------
+Wrong answer #1: "it is already using many cores." While hammering the server in
+a loop, CPU use measured 900-1070%, i.e. 9-11 cores busy. That looked healthy.
+It was an artifact: llama.cpp runs multiple request SLOTS, so several requests
+were in flight at once. That 900% was request-level parallelism, not
+per-decision parallelism. One decision still ran at roughly one core's pace.
+
+Wrong answer #2: "the matmuls are too small to split." Plausible, but it
+predicts that concurrency would scale beautifully. It does not (step 4).
+
+STEP 4 - If one request cannot use the cores, can many?
+-------------------------------------------------------
+This is the natural inference and the right question. Weights are read-only and
+shared between requests, so there is no copying and no lock contention.
+
+Swept 1/2/4/8 concurrent requests. The default configuration was worse than flat:
+
+    concurrency   req/s default   p95 default   req/s --kv-unified   p95 --kv-unified
+    1             0.66            2.7 s         0.99                 1.6 s
+    2             0.64            5.8 s         0.98                 3.6 s
+    4             0.62           16.4 s         0.99                 6.8 s
+    8             0.34           91.0 s         0.95                13.4 s
+
+With defaults, throughput DEGRADES under load and tail latency reaches 91
+seconds. One flag fixes it: --kv-unified, which stops each slot getting an
+isolated KV cache region. That removed the collapse and cut p95 by about 7x.
+
+ACTION FOR YOU: always pass --kv-unified. The provided script does this already.
+
+But throughput is now FLAT at about 1 req/s from concurrency 1 to 8. Thirty-two
+requests take the same wall-clock time whether sent one at a time or eight at a
+time. The hypothesis was wrong.
+
+STEP 5 - The decisive measurement.
+----------------------------------
+If a resource is saturated, which one? Process CPU use was measured at
+concurrency 1 versus 8, on a chip that reports up to 1600%:
+
+    concurrency 1  ->  335% CPU   (of 1600 available)
+    concurrency 8  ->  347% CPU   (of 1600 available)
+
+Eight times the requests, 3% more CPU. The chip is 78% IDLE and refuses to do
+more work. That is not compute saturation. It is a memory wall.
+
+
+-------------------------------------------------------------------------------
+4. WHY IT IS MEMORY-BOUND, AND THE ONE NUMBER THAT PREDICTS PERFORMANCE
+-------------------------------------------------------------------------------
+
+Every decision is one forward pass that must read EVERY layer's weights exactly
+once, with no reuse across layers. So the floor on a single decision is
+model_bytes / memory_bandwidth, and cache only helps if a whole LAYER fits in it.
+
+Per-layer footprint, measured directly from the model files (32 layers):
+
+    quantisation   per layer   total weights   accuracy
+    Q4_K_M          64 MiB      2.51 GiB       202/231
+    Q5_K_M          74 MiB      2.85 GiB       202/231
+    Q8_0           115 MiB      4.16 GiB       204/231
+    BF16           216 MiB      7.84 GiB       205/231
+
+The two CPUs benchmarked have IDENTICAL instruction sets - AVX2, FMA, F16C on
+both - and differ about 5x in speed. What differs is cache:
+
+    CPU                     cores   usable L3   memory                      p50
+    Ryzen 7 5800X           8C/16T   32 MiB     64 GB DDR4 dual-channel    820 ms
+    Core i5-7600K           4C/4T     6 MiB     16 GB DDR4-2667 dual-ch   ~3900 ms
+
+The i5 runs pegged at 400% CPU (all four cores maxed) and still loses by ~5x. It
+is not short of arithmetic; it is short of resident weights. A 64 MiB layer
+against 6 MiB of L3 means every layer streams from DRAM with latency exposed.
+
+=> THE NUMBER THAT PREDICTS PERFORMANCE IS USABLE L3 VERSUS 64 MiB (the Q4 layer
+   size). Not core count, not clock, not instruction set - those were identical
+   between the two machines while performance differed 5x.
+
+IMPORTANT TRAP: "usable" is not what lscpu prints. A Ryzen 9 5950X reports
+"64 MiB (2 instances)", but that is 2 x 32 MiB, one per chiplet, NOT shared. A
+thread only reaches its own, so it behaves like 32 MiB. The same applies to
+multi-die server parts and to multi-socket systems. Always divide the reported
+total by the instance count. The provided script does this and prints "usable
+L3"; trust that line, not the raw lscpu figure.
+
+Secondary finding: Q4_K_M is about 18% faster than Q8_0 (1.27 vs 1.08 req/s,
+p50 481 vs 583 ms) for a 2-of-231 accuracy cost, where every flipped answer was
+already low-confidence (<=0.578). On memory-bound hardware, prefer Q4_K_M.
+
+
+-------------------------------------------------------------------------------
+5. THE OPEN QUESTION (the most valuable thing you can answer)
+-------------------------------------------------------------------------------
+
+Right now, eight concurrent requests perform EIGHT SEPARATE STREAMS of the whole
+model. --kv-unified unified the KV cache but not the weight traversal: each
+request still walks all 32 layers independently. The loop nesting is the problem.
+
+    What happens now:              What would be better:
+    for each request:              for each layer:
+        for each layer:                load layer weights once
+            load layer weights            for each queued request:
+            compute                           compute (weights still in cache)
+
+Traffic implication at Q4_K_M (2.49 GiB of weights per full pass):
+
+    batch   traffic now   traffic if layer-fused   reduction
+    2        4.98 GiB      2.49 GiB                2x
+    4        9.96 GiB      2.49 GiB                4x
+    8       19.91 GiB      2.49 GiB                8x
+
+If the redundant reads were removed, throughput could move from the measured
+~1.3 req/s toward the point where compute finally becomes the limit:
+    ~3.8 req/s   realistic (better prefetch, partial reuse; a 64 MiB layer
+                 still does not fit 32 MiB of L3)
+    ~6.3 req/s   good case
+    ~10  req/s   theoretical ceiling at batch 8
+
+This technique is not exotic - it is continuous batching, and it is why GPU
+serving scales. llama.cpp has the machinery (-b, -ub, --cont-batching). It does
+not fire usefully here because continuous batching was designed for DECODE,
+where merging 32 single-token steps turns tiny bandwidth-bound matmuls into one
+large compute-bound GEMM. A decision request is already a multi-hundred-token
+batch on its own, so merging two of them helps far less.
+
+=> THE OPEN QUESTION: on a CPU with at least 64 MiB of USABLE L3 - enough to
+   hold a full Q4 layer - does throughput finally scale with concurrency, or is
+   it bandwidth-bound all the way down?
+
+   No machine available to the original tester reaches 64 MiB usable. The best
+   is 32 MiB. This is the gap you can close.
+
+   A NEGATIVE RESULT IS EQUALLY VALUABLE. If a CPU that CAN hold a full layer
+   in cache still shows flat req/s as concurrency rises, then cache residency is
+   not the limiter and the bottleneck lives inside llama.cpp's scheduling rather
+   than in the hardware. That tells us to fix software, not buy hardware. Please
+   report it either way.
+
+
+-------------------------------------------------------------------------------
+6. WHICH CPUs TO TEST, AND WHY
+-------------------------------------------------------------------------------
+
+CONFIDENCE WARNING: everything in this section is EXTRAPOLATED from two desktop
+CPUs. Treat it as hypotheses to kill, not predictions. Two attempts to derive
+these figures from FLOP models produced physically impossible answers (214%
+efficiency; a theoretical "peak" slower than measured reality), so the numbers
+below come only from measured throughput and bandwidth ratios, holding the
+observed ~13% bandwidth efficiency constant. Server parts lose more to NUMA than
+that assumes, so treat throughput figures as ceilings.
+
+(a) SINGLE-DECISION LATENCY follows clock, not cores
+Because one decision does not parallelise, per-core speed is what matters:
+clock x IPC x SIMD width. AVX-512 is worth roughly 1.5-1.8x per core on this
+kind of GEMM, not the 2x on paper.
+
+    CPU                          all-core GHz   ISA        est. p50
+    Ryzen 7 5800X (measured)     4.5            AVX2        820 ms
+    EPYC 9354 (Zen4, 32c)        3.6            AVX-512    ~620 ms
+    EPYC 9684X (Zen4-X, 96c)     3.0            AVX-512    ~745 ms
+    Xeon 8480+ (SPR, 56c)        2.6            AVX-512    ~860 ms
+    Xeon 6980P (GNR, 128c)       2.4            AVX-512    ~930 ms
+    EPYC 7763 (Zen3, 64c)        2.9            AVX2      ~1270 ms
+
+Note: A 64-CORE EPYC IS SLOWER PER DECISION THAN A DESKTOP CHIP. Server parts
+trade clock for core count. Do not expect a big server to feel faster on one
+request.
+
+(b) THROUGHPUT follows memory channels
+
+    CPU                            memory            GB/s   usable L3    est. req/s
+    Ryzen 7 5800X (measured ~1.3)  2x DDR4-3200        51   32 MiB            ~2.5
+    EPYC 7763 (Zen3, 64c)          8x DDR4-3200       205   32/CCD             ~10
+    EPYC 7773X (Zen3-X, 64c)       8x DDR4-3200       205   96/CCD             ~10
+    Xeon 8480+ (SPR, 56c)          8x DDR5-4800       307   105 MiB            ~15
+    EPYC 9654 (Zen4, 96c)         12x DDR5-4800       461   32/CCD             ~22
+    EPYC 9684X (Zen4-X, 96c)      12x DDR5-4800       461   96/CCD             ~22
+    Xeon 6980P (GNR, 128c)        12x DDR5-6400       614   504 MiB            ~30
+    Xeon Max 9480 (HBM2e)         64 GB HBM         ~1200   112 MiB            ~58
+
+Multi-socket roughly doubles channels but adds NUMA; assume ~1.7x not 2x, and
+pin one server process per socket (numactl --cpunodebind=N --membind=N).
+
+PRIORITY ORDER:
+
+  1. Any EPYC 9004 "Genoa", ideally the 9354. Twelve DDR5 channels is the
+     biggest single lever (~9x), and at 3.6 GHz the 9354 is the highest-clocked
+     in the family, so it should win on BOTH latency and throughput. Best
+     all-round test.
+
+  2. An X-series EPYC (7773X or 9684X). 96 MiB per chiplet is the only widely
+     available part where a 64 MiB Q4 layer ACTUALLY FITS IN CACHE. This is the
+     one configuration that could break the memory wall rather than just widen
+     it. HIGHEST SCIENTIFIC VALUE - this is the section 5 question.
+
+  3. Xeon Max 9480 if you have one. HBM2e is ~24x desktop DDR4 bandwidth: the
+     largest predicted gain, and the cleanest test of whether bandwidth is
+     truly the limit.
+
+  4. Sapphire Rapids or later Xeon. These have AMX, a matrix accelerator that
+     none of this modelling captures. Could be a step change in either
+     direction; worth running for that reason alone. The script detects and
+     reports AMX flags.
+
+  LOWER PRIORITY: Zen 3 EPYC and Ice Lake Xeon. Real gains, but they confirm the
+  bandwidth story rather than test the cache hypothesis.
+
+  SKIP: anything without AVX2, and any VM exposing a generic CPU model. A KVM
+  guest advertising "QEMU Virtual CPU" has no AVX2/FMA and falls back to scalar
+  code; the measurement would describe the missing instruction set, not the CPU.
+  The script refuses to benchmark these and exits non-zero.
+
+
+-------------------------------------------------------------------------------
+7. PROCEDURE
+-------------------------------------------------------------------------------
+
+Requirements per machine: gcc, g++, cmake, git, python3, curl; about 6 GB free
+disk. No root, no GPU. Nothing is installed system-wide; everything lands in
+./cpudecbench/ which you can delete afterwards.
+
+HOW LONG IT TAKES (first run on a machine builds llama.cpp from source):
+
+    phase                      4-core desktop   32-core server
+    --check                    ~1 s             ~1 s
+    git clone + build          15-25 min        2-4 min
+    model download (2.5 GB)    2-8 min          2-8 min
+    --quick sweeps             ~5 min           ~3 min
+    full sweeps                ~20 min          ~12 min
+
+  So a FIRST --quick run on a small machine is realistically 25-40 minutes,
+  most of it compiling. On a big server, about 10. Later runs reuse the build
+  and the downloaded model, so they really are ~5 min (--quick) or ~20 min
+  (full). Budget accordingly and do not assume something has hung.
+
+THE MACHINE MUST BE IDLE. This workload is sensitive to even one competing
+core. During development a single leftover llama-server process held one core
+of a 4-core box at 99.9% and the benchmark reported 12 tok/s where another
+machine managed 1799 tok/s - a 150x error that looked like a real finding. The
+script now checks load average, other llama-server processes, and any process
+above 50% CPU, and EXITS 3 on a busy machine rather than producing numbers that
+cannot be compared. If you must measure on a loaded host, pass --force and
+label the result as contended. --check does not need an idle machine.
+
+STEP 1 - triage the fleet first (about 1 second per host, no download):
+
+    curl -fLO https://raw.githubusercontent.com/sku10/cpu-decision-bench/main/cpu_decision_bench.sh
+    chmod +x cpu_decision_bench.sh
+    ./cpu_decision_bench.sh --check
+
+  Or across many hosts without copying anything:
+
+    for h in $servers; do
+      echo "=== $h ==="
+      ssh "$h" 'bash -s -- --check' < cpu_decision_bench.sh
+    done
+
+  --check prints CPU model, topology, USABLE L3 (already divided by instance
+  count), memory, board, whether it is virtualised, SIMD support including AMX,
+  and whether a model layer fits in cache. Use it to pick which machines
+  deserve a full run.
+
+  Exit codes:
+    0  usable; worth benchmarking
+    1  cannot run this workload (no AVX2), or a required tool is missing
+    3  machine is busy - re-run when idle, or --force to override
+
+STEP 2 - benchmark the interesting ones:
+
+    ./cpu_decision_bench.sh --quick      # about 5 minutes
+    ./cpu_decision_bench.sh              # full profile, about 20 minutes
+    ./cpu_decision_bench.sh --quant Q8_0 # heavier quant (default is Q4_K_M)
+
+  The script builds a CPU-only llama.cpp at a pinned commit, downloads the
+  model (2.5 GB for Q4_K_M), generates its own benchmark items, and runs:
+    - idle package power (via RAPL where readable)
+    - thread scaling, one request at a time, at -t 1/2/4/all
+    - concurrency at 1/2/4/8, threads = all cores, 8 slots
+    - concurrency at 1/2/4/8, 1 thread per slot
+
+  It already sets threads to physical cores and passes --kv-unified, so you do
+  not need to rediscover section 3.
+
+  For package watts on an AMD or restricted host, RAPL needs to be readable:
+    sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj
+  Without it the watt column reads n/a and everything else still works.
+
+  If the build fails immediately complaining that cmake does not run: a
+  pip-installed 'cmake' shim in ~/.local/bin shadows the system one on some
+  hosts. The script detects this, falls back to /usr/bin/cmake if that works,
+  and otherwise tells you to 'pip uninstall cmake'. It fails in about 2 seconds
+  rather than part-way through a build.
+
+STEP 3 - interpret:
+
+  pattern                                      meaning
+  -------------------------------------------  ------------------------------------
+  req/s flat as concurrency rises, and CPU     MEMORY-BOUND. More cores will not
+  well under 100% of all cores                 help; memory channels and L3 will.
+                                               This is the expected desktop result.
+
+  req/s rises roughly with concurrency         This CPU has headroom - serve
+                                               several requests in parallel. THIS
+                                               RESULT HAS NOT BEEN SEEN ANYWHERE
+                                               YET; it answers section 5.
+
+  p50 flat from -t 1 to -t <physical cores>    A single decision does not
+                                               parallelise. Prefer many slots with
+                                               few threads each over one wide slot.
+
+  large regression at -t <all SMT threads>     SMT contention. Use physical cores.
+
+STEP 4 - report back. Please include:
+    - CPU model, socket count, USABLE L3 (the script's line, not lscpu's total)
+    - memory configuration: channels, DDR generation, speed, DIMM count
+    - the three tables the script prints, verbatim
+    - the SIMD line (especially whether AMX is present)
+    - package watts if RAPL was readable
+    - whether the machine was idle or carrying other load during the run
+
+
+-------------------------------------------------------------------------------
+8. WHAT THIS IS CURRENTLY GOOD FOR
+-------------------------------------------------------------------------------
+
+On the hardware measured so far, CPU inference for decision models is a BATCH
+AND OVERFLOW TOOL, not a GPU replacement:
+
+  VIABLE - queue and batch work. 231 decisions in 2.5-3.3 minutes on a
+  five-year-old desktop CPU, 2.6-4.2 GB of RAM, no GPU. For an asynchronous
+  document or ticket pipeline that is entirely adequate.
+
+  VIABLE - overflow capacity when GPUs are saturated, and a fallback that keeps
+  a service answering when no GPU is available, with IDENTICAL decisions. This
+  is the unusual and valuable part: because no item crosses the 0.80 or 0.90
+  confidence band, the same workload can be routed to GPU or CPU workers without
+  re-tuning any threshold.
+
+  NOT VIABLE - interactive request paths, where a 2.5 s p95 would be felt.
+
+  NOT VIABLE TODAY - high-throughput serving. One machine caps near 1 req/s
+  regardless of concurrency, until either layer-fused batching lands in software
+  or the hardware has far more memory bandwidth.
+
+Deployment shape that follows from the measurements: MANY SLOTS, FEW THREADS
+EACH, not one wide slot. And --kv-unified always.
+
+
+-------------------------------------------------------------------------------
+9. CAVEATS AND KNOWN LIMITS OF THIS WORK
+-------------------------------------------------------------------------------
+
+- Only two CPUs were benchmarked, both desktop parts. Every server-CPU figure in
+  section 6 is an extrapolation.
+- Bandwidth efficiency was measured at only ~11-15% of theoretical peak, so
+  neither test machine was actually at the hardware bandwidth wall. Something
+  else (kernel efficiency, dequantisation overhead, prefetch quality) also
+  contributes. This weakens the pure-bandwidth model and is a reason to measure
+  rather than trust section 6.
+- RAM speed on the Ryzen test machine was not verified (no dmidecode access), so
+  its DDR4-3200 figure is the board default, assumed not measured.
+- The benchmark items the script generates are synthetic but shaped and sized
+  like the real JevBench hard split. Absolute numbers from the script are
+  therefore comparable BETWEEN machines running the script, but not directly
+  against the 231-item figures in section 3, which used the real dataset.
+- The accuracy claims in section 3 are from the real 231-item dataset with
+  verified checksums, not from synthetic items.
+- Model and llama.cpp commit are pinned, so results are comparable over time.
+  If you change either, say so when reporting.
+- One earlier set of figures for the Core i5 machine was discarded because a
+  leftover process was competing for a core. The i5 figures quoted in sections
+  3 and 4 should be treated as approximate for that reason; the Ryzen figures
+  were measured on an idle machine and are the more reliable of the two. This
+  is also why the script now refuses to run on a busy host.
