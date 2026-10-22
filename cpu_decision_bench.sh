@@ -9,12 +9,13 @@
 #   ./cpu_decision_bench.sh --quant Q8_0    # heavier quant
 #   ./cpu_decision_bench.sh --quick         # ~4 min instead of ~20
 #   ./cpu_decision_bench.sh --check         # just print hardware verdict, run nothing
+#   ./cpu_decision_bench.sh --force         # benchmark even if the machine is busy
 #
 # Needs: gcc/g++, cmake, git, python3, curl, ~6 GB disk. No root, no GPU.
 # Everything lands in ./cpudecbench/ under the current directory.
 set -uo pipefail
 
-QUANT=Q4_K_M; QUICK=0; CHECK_ONLY=0; PORT=8199
+QUANT=Q4_K_M; QUICK=0; CHECK_ONLY=0; PORT=8199; FORCE=0
 REPO=https://github.com/ggml-org/llama.cpp.git
 COMMIT=0a1ef309cdbb9f2024f58a38fb4c42352c5db569   # first release with /v1/systemone
 HF_REPO=h2oai/h2o-lightning-4b-gguf
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
     --quant) QUANT="$2"; shift 2;;
     --quick) QUICK=1; shift;;
     --check) CHECK_ONLY=1; shift;;
+    --force) FORCE=1; shift;;
     --port)  PORT="$2"; shift 2;;
     -h|--help) sed -n '2,16p' "$0"; exit 0;;
     *) echo "unknown arg: $1"; exit 2;;
@@ -131,6 +133,41 @@ if ! cmake --version >/dev/null 2>&1; then
   fi
 fi
 CMAKE="${CMAKE:-cmake}"
+
+# ---------------------------------------------------------------- contention
+# A busy machine silently produces wrong numbers. This workload is sensitive to
+# even one competing core: a stray llama-server on a 4-core box cost us 25% of
+# the machine and produced figures 150x off before we caught it.
+say "machine is quiet?"
+CONTENDED=0
+LOAD1=$(awk '{print $1}' /proc/loadavg)
+LOAD_INT=${LOAD1%.*}
+if [ "${LOAD_INT:-0}" -ge 2 ]; then
+  echo "WARNING: 1-minute load average is $LOAD1 on $NPROC threads."
+  echo "         Another workload is running. Results will be understated."
+  CONTENDED=1
+fi
+STRAY=$(ps -eo pid=,cmd= 2>/dev/null | grep '[l]lama-server' | grep -cv "port $PORT" || true)
+if [ "${STRAY:-0}" -gt 0 ]; then
+  echo "WARNING: $STRAY other llama-server process(es) already running:"
+  ps -eo pid=,etime=,pcpu=,cmd= 2>/dev/null | grep '[l]lama-server' | head -3 | cut -c1-100 | sed 's/^/    /'
+  echo "         Stop them first, or this benchmark measures the leftovers too."
+  CONTENDED=1
+fi
+HOGS=$(ps -eo pcpu=,comm= --sort=-pcpu 2>/dev/null | awk '$1>50 {print $2}' | head -3 | tr '\n' ' ')
+if [ -n "${HOGS// /}" ] && [ "$CONTENDED" = 0 ]; then
+  echo "WARNING: process(es) above 50% CPU: $HOGS"
+  CONTENDED=1
+fi
+if [ "$CONTENDED" = 1 ]; then
+  echo
+  echo "  Benchmark on an IDLE machine. Re-run when it is quiet, or pass"
+  echo "  --force to measure anyway and label the result as contended."
+  [ "${FORCE:-0}" = 1 ] || exit 3
+  echo "  --force given: continuing. REPORT THESE NUMBERS AS CONTENDED."
+else
+  echo "load $LOAD1 on $NPROC threads, no competing llama-server, no CPU hogs -- OK"
+fi
 
 mkdir -p "$ROOT"/{models,data} && cd "$ROOT" || exit 1
 
