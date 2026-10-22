@@ -106,23 +106,49 @@ fi
 [ "$CHECK_ONLY" = 1 ] && exit $FATAL
 [ "$FATAL" = 1 ] && { echo; echo "Refusing to benchmark without AVX2. Re-run with --check to see this verdict only."; exit 1; }
 
-for t in gcc g++ cmake git python3 curl; do
+for t in gcc g++ git python3 curl; do
   command -v "$t" >/dev/null || { echo "MISSING TOOL: $t"; exit 1; }
 done
+# cmake must not merely exist -- a broken pip-installed shim in ~/.local/bin
+# shadows the real one and fails only once the build starts.
+if ! cmake --version >/dev/null 2>&1; then
+  echo "cmake is present but does not run:"
+  cmake --version 2>&1 | sed 's/^/    /' | head -4
+  WORKING_CMAKE=""
+  for c in /usr/bin/cmake /usr/local/bin/cmake /opt/homebrew/bin/cmake; do
+    [ -x "$c" ] && "$c" --version >/dev/null 2>&1 && { WORKING_CMAKE="$c"; break; }
+  done
+  if [ -n "$WORKING_CMAKE" ]; then
+    echo "  -> using $WORKING_CMAKE instead (a shim earlier in PATH is broken)"
+    CMAKE="$WORKING_CMAKE"
+  else
+    echo "  -> no working cmake found. Install it:"
+    echo "       Debian/Ubuntu : sudo apt install cmake"
+    echo "       RHEL/Fedora   : sudo dnf install cmake"
+    echo "     If a pip 'cmake' package is shadowing the system one:"
+    echo "       pip uninstall cmake   (or remove ~/.local/bin/cmake)"
+    exit 1
+  fi
+fi
+CMAKE="${CMAKE:-cmake}"
 
 mkdir -p "$ROOT"/{models,data} && cd "$ROOT" || exit 1
 
 # ---------------------------------------------------------------- build
 say "build (CPU-only llama.cpp @ ${COMMIT:0:9})"
 if [ ! -x llama.cpp/build/bin/llama-server ]; then
-  [ -d llama.cpp ] || git clone -q --progress=false --filter=blob:none "$REPO" llama.cpp 2>/dev/null || git clone -q --filter=blob:none "$REPO" llama.cpp || exit 1
+  [ -d llama.cpp ] || git clone -q --no-progress --filter=blob:none "$REPO" llama.cpp || exit 1
   ( cd llama.cpp \
     && git fetch --depth=1 origin "$COMMIT" 2>/dev/null \
     && git checkout -q "$COMMIT" \
-    && cmake -B build -DGGML_CUDA=OFF -DGGML_METAL=OFF -DLLAMA_CURL=ON \
+    && "$CMAKE" -B build -DGGML_CUDA=OFF -DGGML_METAL=OFF -DLLAMA_CURL=ON \
              -DCMAKE_BUILD_TYPE=Release > /tmp/cdb-cmake.log 2>&1 \
-    && cmake --build build --target llama-server -j"$NPROC" > /tmp/cdb-build.log 2>&1 ) \
-    || { echo "build failed; see /tmp/cdb-build.log"; tail -20 /tmp/cdb-build.log; exit 1; }
+    && "$CMAKE" --build build --target llama-server -j"$NPROC" > /tmp/cdb-build.log 2>&1 ) \
+    || { echo "BUILD FAILED. Last output:"
+         for L in /tmp/cdb-build.log /tmp/cdb-cmake.log; do
+           [ -s "$L" ] && { echo "--- $L ---"; tail -15 "$L"; }
+         done
+         exit 1; }
 fi
 BIN="$ROOT/llama.cpp/build/bin/llama-server"
 "$BIN" --version 2>&1 | head -2
