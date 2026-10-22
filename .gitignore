@@ -1,0 +1,6 @@
+# the script's own working directory: build tree, model weights, results
+cpudecbench/
+__pycache__/
+*.pyc
+*.gguf
+*.jsonl
